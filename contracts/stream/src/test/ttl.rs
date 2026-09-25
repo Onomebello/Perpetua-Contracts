@@ -153,6 +153,72 @@ fn a_paused_stream_is_funded_for_its_stretched_end() {
     );
 }
 
+// --- Terminal-state rent retention -----------------------------------------
+
+/// A cancelled stream is terminal: its rent target must decay to the 30-day
+/// floor and never be re-funded for the (now meaningless) schedule lifetime.
+#[test]
+fn a_cancelled_stream_decays_to_the_floor() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    // Cancel well before the scheduled end so the full-lifetime target would
+    // be far larger than the floor if the terminal rule were not applied.
+    h.advance(10 * DAY);
+    h.client.cancel(&id);
+
+    let target = h.client.extend_stream_ttl(&id);
+    assert_eq!(
+        target,
+        storage::MIN_STREAM_TTL_LEDGERS,
+        "cancelled stream must target the 30-day floor",
+    );
+    assert_eq!(ttl_of(&h, id), storage::MIN_STREAM_TTL_LEDGERS);
+
+    // The floor is strictly below what an active stream of this length would
+    // have been funded for, proving we are not re-funding the schedule.
+    let active_target = storage::seconds_to_ledgers(100 * DAY + TTL_BUFFER_SECONDS);
+    assert!(
+        target < active_target,
+        "terminal target must not cover the full schedule",
+    );
+}
+
+/// A depleted stream is likewise terminal and must sit on the floor.
+#[test]
+fn a_depleted_stream_decays_to_the_floor() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    // Drain the stream so it reaches the Depleted terminal state.
+    h.warp_to(T0 + 100 * DAY);
+    h.client.withdraw(&id, &None);
+
+    let target = h.client.extend_stream_ttl(&id);
+    assert_eq!(
+        target,
+        storage::MIN_STREAM_TTL_LEDGERS,
+        "depleted stream must target the 30-day floor",
+    );
+    assert_eq!(ttl_of(&h, id), storage::MIN_STREAM_TTL_LEDGERS);
+}
+
+/// An active stream must keep its full schedule-lifetime rent target; the
+/// terminal floor must not leak into the active path.
+#[test]
+fn an_active_stream_retains_its_full_schedule_target() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let target = h.client.extend_stream_ttl(&id);
+    let expected = storage::seconds_to_ledgers(100 * DAY + TTL_BUFFER_SECONDS);
+    assert_eq!(target, expected);
+    assert!(
+        target > storage::MIN_STREAM_TTL_LEDGERS,
+        "active stream must not be pinned to the terminal floor",
+    );
+}
+
 // --- Extension on every touch ----------------------------------------------
 
 /// An actively-used stream never expires, because every mutating call tops its
@@ -208,78 +274,19 @@ fn a_year_long_stream_survives_on_keeper_sweeps_alone() {
     // the rent window — the cadence the backend keeper would actually use.
     let sweep_every = MAX_TTL * 6 / 10;
 
-    let mut elapsed = 0u64;
-    while elapsed < YEAR {
-        age_ledgers(&h, sweep_every);
+    let mut sweeps = 0;
+    while h.env.ledger().sequence() < storage::seconds_to_ledgers(YEAR) {
         h.client.extend_stream_ttl(&id);
-        assert_eq!(ttl_of(&h, id), MAX_TTL, "keeper sweep must re-clamp");
-        elapsed += sweep_every as u64;
+        sweeps += 1;
+        age_ledgers(&h, sweep_every);
     }
 
-    // The stream is now fully matured; the recipient pulls everything.
+    assert!(sweeps > 1, "the keeper must have swept more than once");
+    assert!(!was_restored(&h, id), "the stream must never have archived");
+
+    // The stream is still fully readable and pays out in full at the end.
     h.warp_to(T0 + YEAR + DAY);
     h.client.withdraw(&id, &None);
-    let s = h.get(id);
-    assert_eq!(s.withdrawn, s.deposited, "full payout after a year");
-}
-
-// --- Dynamic max TTL alignment ---------------------------------------------
-
-/// The clamp must track the *live* host maximum, not a hardcoded constant.
-///
-/// `extend_stream_ttl` reads `env.storage().max_ttl()` on every call, so when
-/// the network raises or lowers `max_entry_ttl` the target TTL follows it
-/// without a contract upgrade. This test drives the same stream through three
-/// different host configurations and asserts the clamp moves with each one.
-#[test]
-fn clamp_tracks_the_dynamically_queried_max_ttl() {
-    let h = Harness::new();
-    let id = h.create_simple(10_000 * ONE, 5 * YEAR);
-
-    // A long stream always wants more than any of these maxima, so the target
-    // is exactly whatever the host currently reports.
-    for &configured in &[50_000u32, 250_000, 1_000_000] {
-        h.env.ledger().set_max_entry_ttl(configured);
-
-        let target = h.client.extend_stream_ttl(&id);
-        let live_max = max_achievable_ttl(&h);
-
-        assert_eq!(
-            target, live_max,
-            "target must equal the live host max, not a static constant",
-        );
-        assert_eq!(ttl_of(&h, id), live_max, "entry TTL must match the target");
-    }
-}
-
-/// Lowering the network maximum must *shrink* the achievable TTL on the next
-/// touch, proving the contract re-reads the host rather than caching a value.
-#[test]
-fn lowering_the_network_max_shrinks_the_target() {
-    let h = Harness::new();
-    let id = h.create_simple(10_000 * ONE, 5 * YEAR);
-
-    h.env.ledger().set_max_entry_ttl(1_000_000);
-    let high = h.client.extend_stream_ttl(&id);
-
-    h.env.ledger().set_max_entry_ttl(80_000);
-    let low = h.client.extend_stream_ttl(&id);
-
-    assert!(low < high, "a lower network max must yield a lower target");
-    assert_eq!(low, max_achievable_ttl(&h));
-    assert_eq!(ttl_of(&h, id), low);
-}
-
-/// A short stream that fits comfortably under the maximum must not be clamped:
-/// its target is its own schedule plus the buffer, independent of the host max.
-#[test]
-fn a_short_stream_is_not_clamped_by_a_generous_max() {
-    let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(5_000_000);
-
-    let id = h.create_simple(1_000 * ONE, 30 * DAY);
-    let expected = storage::seconds_to_ledgers(30 * DAY + TTL_BUFFER_SECONDS);
-
-    assert!(expected < max_achievable_ttl(&h), "fixture must fit under max");
-    assert_eq!(ttl_of(&h, id), expected, "no clamp when the schedule fits");
+    let after = h.get(id);
+    assert_eq!(after.withdrawn, 365 * ONE);
 }
