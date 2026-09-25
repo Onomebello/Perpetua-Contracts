@@ -24,11 +24,66 @@
 //! which is far below anything this contract ever sets. [`was_restored`] uses
 //! that as a detector for "this entry archived".
 
+use std::collections::BTreeSet;
+
 use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::testutils::Ledger as _;
 
 use super::common::*;
 use crate::{storage, DataKey, TTL_BUFFER_SECONDS};
+
+#[derive(Clone, Debug, Default)]
+struct MockPersistentStorage {
+    live: BTreeSet<u64>,
+    expired: BTreeSet<u64>,
+}
+
+impl MockPersistentStorage {
+    fn mark_live(&mut self, stream_id: u64) {
+        self.live.insert(stream_id);
+        self.expired.remove(&stream_id);
+    }
+
+    fn mark_expired(&mut self, stream_id: u64) {
+        self.expired.insert(stream_id);
+        self.live.remove(&stream_id);
+    }
+
+    fn get(&self, stream_id: u64) -> Option<u64> {
+        if self.expired.contains(&stream_id) {
+            None
+        } else if self.live.contains(&stream_id) {
+            Some(stream_id)
+        } else {
+            None
+        }
+    }
+
+    fn stream_exists(&self, stream_id: u64) -> bool {
+        self.get(stream_id).is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamArchiveState {
+    Live,
+    Archived,
+    Missing,
+}
+
+fn detect_stream_archive_state(
+    storage: &MockPersistentStorage,
+    stream_id: u64,
+    stream_count: u64,
+) -> StreamArchiveState {
+    if stream_id >= stream_count {
+        StreamArchiveState::Missing
+    } else if storage.stream_exists(stream_id) {
+        StreamArchiveState::Live
+    } else {
+        StreamArchiveState::Archived
+    }
+}
 
 #[test]
 fn persisted_stream_fixture_survives_read_mutate_and_ttl_extension() {
@@ -101,6 +156,47 @@ fn creation_covers_the_whole_stream_plus_the_buffer() {
         expected > min * 100,
         "creation TTL barely above the default"
     );
+}
+
+#[test]
+fn min_stream_ttl_includes_a_drift_safety_margin() {
+    let nominal_days = TTL_BUFFER_SECONDS / storage::SECONDS_PER_LEDGER;
+    let drift_margin = nominal_days * 11 / 10;
+
+    assert!(
+        storage::MIN_STREAM_TTL_LEDGERS as u64 >= drift_margin,
+        "minimum TTL should keep a buffer against ledger drift",
+    );
+}
+
+#[test]
+fn mock_storage_reports_expired_keys_as_archived_streams() {
+    let mut storage = MockPersistentStorage::default();
+    storage.mark_live(0);
+    storage.mark_live(2);
+    storage.mark_expired(1);
+
+    assert_eq!(
+        detect_stream_archive_state(&storage, 0, 3),
+        StreamArchiveState::Live
+    );
+    assert_eq!(
+        detect_stream_archive_state(&storage, 1, 3),
+        StreamArchiveState::Archived
+    );
+    assert_eq!(
+        detect_stream_archive_state(&storage, 2, 3),
+        StreamArchiveState::Live
+    );
+    assert_eq!(
+        detect_stream_archive_state(&storage, 3, 3),
+        StreamArchiveState::Missing
+    );
+    assert_eq!(
+        detect_stream_archive_state(&storage, 9, 3),
+        StreamArchiveState::Missing
+    );
+    assert!(storage.get(1).is_none(), "expired persistent keys should read as absent");
 }
 
 /// A multi-year stream exceeds `max_entry_ttl`, so it clamps — which is exactly

@@ -85,12 +85,27 @@ pub const SECONDS_PER_LEDGER: u64 = 5;
 /// otherwise archive.
 pub const TTL_BUFFER_SECONDS: u64 = 30 * 24 * 60 * 60;
 
+/// Safety margin applied to the 30-day minimum TTL to absorb ledger-close drift.
+///
+/// The network does not close every ledger at exactly 5s; actual close time can
+/// drift above or below that nominal value. Using a small headroom means a
+/// nominal 30-day floor still remains well above 30 days in wall-clock terms if
+/// the network slows to around 5.2s/ledger, while also giving the keeper a bit
+/// of slack when the network is slightly faster than expected.
+pub const LEDGER_DRIFT_SAFETY_MULTIPLIER_NUMERATOR: u64 = 11;
+pub const LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR: u64 = 10;
+
 /// Floor for any stream entry's TTL, in ledgers, regardless of how little
-/// lifetime the stream has left. Roughly 30 days at the nominal close time.
+/// lifetime the stream has left. Roughly 30 days at the nominal close time,
+/// with a 10% headroom to absorb drift.
 ///
 /// A settled stream still has to stay readable: the recipient may not have
 /// withdrawn their tail yet, and the indexer needs to see the final state.
-pub const MIN_STREAM_TTL_LEDGERS: u32 = (TTL_BUFFER_SECONDS / SECONDS_PER_LEDGER) as u32;
+pub const MIN_STREAM_TTL_LEDGERS: u32 = ((TTL_BUFFER_SECONDS
+    * LEDGER_DRIFT_SAFETY_MULTIPLIER_NUMERATOR
+    + (LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR - 1))
+    / LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR
+    / SECONDS_PER_LEDGER) as u32;
 
 /// Convert a wall-clock duration into a ledger count, rounding up.
 ///
@@ -171,7 +186,36 @@ pub fn ttl_target_ledgers_at(env: &Env, stream: &Stream, now: u64) -> u32 {
     floored.min(max_entry_ttl(env))
 }
 
-/// Bump the instance entry. Tiny, and it carries the id counter, so it is
-/// always extended to the netwo
+/// Read the next stream id, defaulting to `0` on a fresh contract.
+pub fn next_stream_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextStreamId)
+        .unwrap_or(0)
+}
 
-/* … truncated 7453 chars — edit only what you need near the top … */
+/// Allocate the next stream id, guarding against `u64` overflow.
+///
+/// The counter is read from instance storage, incremented with `checked_add`,
+/// and written back. If the counter is already at `u64::MAX` the increment
+/// would silently wrap to `0` and collide with live streams, so the overflow
+/// is surfaced as [`Error::StreamIdOverflow`] instead.
+///
+/// The instance entry is re-extended to the network maximum on every
+/// allocation so the id counter can never archive before the streams it
+/// issued (see the module docs on the ordering guarantee).
+pub fn allocate_stream_id(env: &Env) -> Result<u64, Error> {
+    let current = next_stream_id(env);
+    let next = current.checked_add(1).ok_or(Error::StreamIdOverflow)?;
+    env.storage().instance().set(&DataKey::NextStreamId, &next);
+    extend_instance(env);
+    Ok(next)
+}
+
+/// Bump the instance entry. Tiny, and it carries the id counter, so it is
+/// always extended to the network maximum.
+pub fn extend_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(env.storage().max_ttl(), env.storage().max_ttl());
+}

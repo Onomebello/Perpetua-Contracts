@@ -479,6 +479,7 @@ Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.
 | | |
 |---|---|
 | [docs/ABI.md](docs/ABI.md) | **Interface of record.** Frozen 2026-08-12. Read this before integrating. |
+| [docs/gas.md](docs/gas.md) | Factory policy-overhead benchmark, resource breakdown, and reproduction command. |
 | [docs/griefing-analysis-extend-ttl.md](docs/griefing-analysis-extend-ttl.md) | Issue #97: formal audit of the permissionless TTL keeper surface. |
 | [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | What a green suite does not prove. |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
