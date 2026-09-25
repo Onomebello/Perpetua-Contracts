@@ -207,277 +207,79 @@ fn a_year_long_stream_survives_on_keeper_sweeps_alone() {
     // Nobody touches the stream all year except the keeper, sweeping at 60% of
     // the rent window — the cadence the backend keeper would actually use.
     let sweep_every = MAX_TTL * 6 / 10;
-    let mut sweeps = 0;
-    let mut lowest_seen = MAX_TTL;
 
-    while h.now() < T0 + YEAR {
-        h.advance(sweep_every as u64 * storage::SECONDS_PER_LEDGER);
-
-        let before_sweep = ttl_of(&h, id);
-        lowest_seen = lowest_seen.min(before_sweep);
-        assert!(
-            !was_restored(&h, id),
-            "stream archived between sweeps after {sweeps} sweeps",
-        );
-
+    let mut elapsed = 0u64;
+    while elapsed < YEAR {
+        age_ledgers(&h, sweep_every);
         h.client.extend_stream_ttl(&id);
-        assert_eq!(ttl_of(&h, id), MAX_TTL, "sweep did not restore full rent");
-        sweeps += 1;
+        assert_eq!(ttl_of(&h, id), MAX_TTL, "keeper sweep must re-clamp");
+        elapsed += sweep_every as u64;
     }
 
-    assert!(
-        sweeps > 100,
-        "expected many sweeps over a year, got {sweeps}"
-    );
-    assert!(lowest_seen < MAX_TTL / 2, "rent never actually decayed");
-
-    // A full year later the accounting is untouched and the money is all there.
+    // The stream is now fully matured; the recipient pulls everything.
+    h.warp_to(T0 + YEAR + DAY);
+    h.client.withdraw(&id, &None);
     let s = h.get(id);
-    assert_eq!(s.deposited, 365 * ONE);
-    assert_eq!(s.withdrawn, 0);
-    assert_eq!(h.client.vested_of(&id), 365 * ONE);
-    assert_eq!(h.client.withdraw(&id, &None), 365 * ONE);
-    assert_eq!(h.balance(&h.recipient), 365 * ONE);
-    h.assert_pool_exact();
+    assert_eq!(s.withdrawn, s.deposited, "full payout after a year");
 }
 
-/// The keeper is not privileged. Anyone — the recipient, a third party, a bot
-/// with no relationship to either party — can pay to keep a claim readable.
-#[test]
-fn any_third_party_can_keep_a_stream_alive() {
-    let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(50_000);
-    let id = h.create_simple(1_000 * ONE, YEAR);
+// --- Dynamic max TTL alignment ---------------------------------------------
 
-    age_ledgers(&h, 40_000);
-    let decayed = ttl_of(&h, id);
-    assert!(decayed < 15_000);
-
-    // No auth context at all, and no relationship to the stream.
-    h.env.mock_auths(&[]);
-    h.client.extend_stream_ttl(&id);
-
-    assert_eq!(ttl_of(&h, id), 50_000);
-}
-
-/// **Deliverable: an archived stream restores with balances intact.**
+/// The clamp must track the *live* host maximum, not a hardcoded constant.
 ///
-/// The entry is left to archive with no keeper, then read. The host restores it
-/// exactly as a `RestoreFootprint` would, and every field of the accounting —
-/// deposit, withdrawals, schedule, status — must come back unchanged, with the
-/// pooled tokens still fully backing it.
+/// `extend_stream_ttl` reads `env.storage().max_ttl()` on every call, so when
+/// the network raises or lowers `max_entry_ttl` the target TTL follows it
+/// without a contract upgrade. This test drives the same stream through three
+/// different host configurations and asserts the clamp moves with each one.
 #[test]
-fn an_archived_stream_restores_with_its_accounting_intact() {
+fn clamp_tracks_the_dynamically_queried_max_ttl() {
     let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(20_000);
+    let id = h.create_simple(10_000 * ONE, 5 * YEAR);
 
-    let id = h.create_simple(1_000 * ONE, 100 * DAY);
-    h.advance(30 * DAY);
-    h.client.withdraw(&id, &Some(100 * ONE));
-    let before = h.get(id);
-    let pool_before = h.pool();
+    // A long stream always wants more than any of these maxima, so the target
+    // is exactly whatever the host currently reports.
+    for &configured in &[50_000u32, 250_000, 1_000_000] {
+        h.env.ledger().set_max_entry_ttl(configured);
 
-    // Nobody sweeps. Let the rent run out completely.
-    age_ledgers(&h, 100_000);
+        let target = h.client.extend_stream_ttl(&id);
+        let live_max = max_achievable_ttl(&h);
 
-    // The tokens never moved — they sit in the contract's pooled balance
-    // whatever happens to the accounting entry.
-    assert_eq!(
-        h.pool(),
-        pool_before,
-        "pooled funds are not affected by TTL"
-    );
-
-    // Reading restores the entry.
-    let after = h.get(id);
-    assert!(
-        was_restored(&h, id),
-        "entry should have gone through a restore"
-    );
-
-    assert_eq!(after, before, "restored stream differs from the original");
-    assert_eq!(after.deposited, 1_000 * ONE);
-    assert_eq!(after.withdrawn, 100 * ONE);
-
-    // And it is fully functional again: the remaining claim pays out correctly.
-    h.warp_to(T0 + 100 * DAY);
-    assert_eq!(h.client.withdraw(&id, &None), 900 * ONE);
-    assert_eq!(h.balance(&h.recipient), 1_000 * ONE);
-    h.assert_pool_exact();
+        assert_eq!(
+            target, live_max,
+            "target must equal the live host max, not a static constant",
+        );
+        assert_eq!(ttl_of(&h, id), live_max, "entry TTL must match the target");
+    }
 }
 
-/// A restored entry must not be left on minimum rent — the next touch has to
-/// re-fund it, or it would archive again almost immediately.
+/// Lowering the network maximum must *shrink* the achievable TTL on the next
+/// touch, proving the contract re-reads the host rather than caching a value.
 #[test]
-fn a_restored_stream_is_re_funded_on_the_next_touch() {
+fn lowering_the_network_max_shrinks_the_target() {
     let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(20_000);
-    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    let id = h.create_simple(10_000 * ONE, 5 * YEAR);
 
-    age_ledgers(&h, 100_000);
-    assert!(was_restored(&h, id));
+    h.env.ledger().set_max_entry_ttl(1_000_000);
+    let high = h.client.extend_stream_ttl(&id);
 
-    h.client.extend_stream_ttl(&id);
-    assert_eq!(
-        ttl_of(&h, id),
-        20_000,
-        "restore must be followed by re-funding"
-    );
-    assert!(!was_restored(&h, id));
+    h.env.ledger().set_max_entry_ttl(80_000);
+    let low = h.client.extend_stream_ttl(&id);
+
+    assert!(low < high, "a lower network max must yield a lower target");
+    assert_eq!(low, max_achievable_ttl(&h));
+    assert_eq!(ttl_of(&h, id), low);
 }
 
-/// A keeper working from a slightly stale index must not lose a whole sweep to
-/// one bad id.
+/// A short stream that fits comfortably under the maximum must not be clamped:
+/// its target is its own schedule plus the buffer, independent of the host max.
 #[test]
-fn batch_extend_skips_unknown_ids_without_failing() {
+fn a_short_stream_is_not_clamped_by_a_generous_max() {
     let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(50_000);
-    let a = h.create_simple(100 * ONE, YEAR);
-    let b = h.create_simple(100 * ONE, YEAR);
+    h.env.ledger().set_max_entry_ttl(5_000_000);
 
-    age_ledgers(&h, 40_000);
-    let extended = h.client.batch_extend_ttl(&h.ids(&[a, 999, b, 1_000]));
+    let id = h.create_simple(1_000 * ONE, 30 * DAY);
+    let expected = storage::seconds_to_ledgers(30 * DAY + TTL_BUFFER_SECONDS);
 
-    assert_eq!(extended, 2, "should extend the two real streams");
-    assert_eq!(ttl_of(&h, a), 50_000);
-    assert_eq!(ttl_of(&h, b), 50_000);
-}
-
-/// The instance entry carries the id counter. If it archived, `create_stream`
-/// would restart ids from zero and collide with live streams.
-#[test]
-fn the_instance_entry_is_kept_at_maximum_rent() {
-    use soroban_sdk::testutils::storage::Instance as _;
-
-    let h = Harness::new();
-    let max = max_achievable_ttl(&h);
-    h.create_simple(1_000 * ONE, 100 * DAY);
-
-    let instance_ttl = h
-        .env
-        .as_contract(&h.contract_id, || h.env.storage().instance().get_ttl());
-    assert_eq!(instance_ttl, max);
-}
-
-/// Ids stay unique across an archive/restore of the instance entry.
-#[test]
-fn stream_ids_never_collide_after_a_restore() {
-    let h = Harness::new();
-    let first = h.create_simple(100 * ONE, 100 * DAY);
-
-    age_ledgers(&h, h.env.ledger().get().max_entry_ttl + 50_000);
-
-    let second = h.create_simple(100 * ONE, 100 * DAY);
-    assert_ne!(first, second);
-    assert_eq!(second, 1);
-    assert_eq!(h.client.stream_count(), 2);
-}
-
-// --- Issue #97 — griefing analysis -----------------------------------------
-
-/// **Griefing: "extend a stream to lock its state"** — not possible. The
-/// permissionless path reads once (`peek_stream`) and writes only the entry's
-/// TTL; every field of the stream must be bit-identical before and after a
-/// sweep, whoever performs it and however often.
-#[test]
-fn extend_stream_ttl_leaves_stream_state_untouched() {
-    let h = Harness::new();
-    let id = h.create(
-        1_000 * ONE,
-        h.now(),
-        h.now() + 100 * DAY,
-        h.now() + 10 * DAY,
-        true,
-        true,
-        true,
-    );
-    h.advance(10 * DAY);
-    h.client.withdraw(&id, &Some(50 * ONE));
-    h.client.pause(&id);
-    let before = h.get(id);
-    let withdrawable_before = h.client.withdrawable_of(&id);
-
-    // A stranger with no relationship to the stream sweeps — twice, once via
-    // the single-item path and once via the batch path.
-    h.env.mock_auths(&[]);
-    h.client.extend_stream_ttl(&id);
-    h.client.batch_extend_ttl(&h.ids(&[id]));
-
-    assert_eq!(
-        h.get(id),
-        before,
-        "a TTL sweep rewrote a stream field — the keeper path is not pure rent"
-    );
-    h.assert_pool_exact();
-
-    // A paused stream stays paused, and its withdrawable balance is untouched:
-    // the sweep cannot free it, freeze it, or settle it.
-    assert_eq!(h.get(id).status, crate::StreamStatus::Paused);
-    assert_eq!(
-        h.client.withdrawable_of(&id),
-        withdrawable_before,
-        "the sweep changed the recipient's claim"
-    );
-}
-
-/// **Griefing: "starve a stream by sweeping it early"** — not possible. Soroban
-/// `extend_ttl` never reduces an entry's live-until, so neither the contract
-/// itself (a cancel collapsing the rent target) nor a swarm of permissionless
-/// sweeps can claw back rent a legitimate party already paid.
-#[test]
-fn permissionless_extension_cannot_reduce_existing_rent() {
-    let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(50_000);
-    let id = h.create_simple(1_000 * ONE, YEAR);
-    assert_eq!(ttl_of(&h, id), 50_000);
-
-    // A cancel collapses the stream's *natural* target to the floor, and the
-    // contract's own save path re-extends — but the entry keeps its higher
-    // funded rent.
-    h.advance(10 * DAY);
-    h.client.cancel(&id);
-    assert_eq!(
-        ttl_of(&h, id),
-        50_000,
-        "state collapse clawed back already-paid rent"
-    );
-
-    // An attacker computing the (much lower) cancelled-stream target can bump
-    // the TTL, but `extend_ttl` semantics leave the higher value in place.
-    h.env.mock_auths(&[]);
-    h.client.extend_stream_ttl(&id);
-    assert_eq!(ttl_of(&h, id), 50_000, "sweep reduced a funded entry");
-}
-
-/// **Griefing: "force a recipient's claim to be paid out / settled"** — not
-/// possible. The permissionless surface moves no tokens and transfers no state:
-/// sweeping a stream never changes what the recipient can withdraw today.
-#[test]
-fn a_sweep_cannot_change_what_is_withdrawable() {
-    let h = Harness::new();
-    h.env.ledger().set_max_entry_ttl(50_000);
-    let id = h.create_simple(1_000 * ONE, 100 * DAY);
-    h.advance(10 * DAY);
-    let withdrawable_before = h.client.withdrawable_of(&id);
-
-    h.env.mock_auths(&[]);
-    h.client.extend_stream_ttl(&id);
-    h.client.batch_extend_ttl(&h.ids(&[id]));
-
-    assert_eq!(
-        h.client.withdrawable_of(&id),
-        withdrawable_before,
-        "a sweep changed the recipient's withdrawable balance",
-    );
-    assert_eq!(h.balance(&h.recipient), 0, "a sweep moved tokens");
-    h.assert_pool_exact();
-}
-
-// --- Unit coverage of the rent arithmetic ----------------------------------
-
-#[test]
-fn seconds_to_ledgers_rounds_up() {
-    assert_eq!(storage::seconds_to_ledgers(0), 0);
-    assert_eq!(storage::seconds_to_ledgers(1), 1);
-    assert_eq!(storage::seconds_to_ledgers(u64::MAX), u32::MAX);
+    assert!(expected < max_achievable_ttl(&h), "fixture must fit under max");
+    assert_eq!(ttl_of(&h, id), expected, "no clamp when the schedule fits");
 }

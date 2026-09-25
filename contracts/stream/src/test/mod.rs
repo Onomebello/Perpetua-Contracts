@@ -57,6 +57,7 @@ mod lifecycle_proptest;
 mod monotonicity;
 mod release_profile;
 mod resource_limits;
+// Issue #16: extend_stream_ttl clamps to the dynamically queried max_entry_ttl.
 mod ttl;
 
 // Stage 4
