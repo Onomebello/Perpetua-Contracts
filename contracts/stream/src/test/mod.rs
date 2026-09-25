@@ -41,6 +41,7 @@ mod pause;
 mod race_cancel_withdraw;
 mod storage_keys;
 mod terminal_operations;
+// Issue #14: SEP-41 non-standard return values and transfer failure rollbacks.
 mod token_errors;
 mod top_up;
 mod transfer;
