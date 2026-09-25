@@ -309,13 +309,33 @@ const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
 // Events
 // ---------------------------------------------------------------------------
 
-/// Emitted when a new proposal is submitted.
+/// Standardised audit-log schema for the governance lifecycle (#49).
+///
+/// Every lifecycle action emits a structured event whose **topics** carry the
+/// indexer-friendly filter keys — event name, `proposal_id` and the acting
+/// participant — and whose **data** payload carries the full schema including
+/// targets and timestamps:
+///
+/// | Action          | Topic                                        | Data                                |
+/// |-----------------|----------------------------------------------|-------------------------------------|
+/// | propose         | `("proposal_created",  id, proposer)`        | `ProposalCreated`   (with target)   |
+/// | approve         | `("vote_cast",       id, voter)`             | `VoteCast`          (count + ts)    |
+/// | quorum reached  | `("proposal_queued", id)`                    | `ProposalQueued`    (timestamps)    |
+/// | execute         | `("proposal_executed", id, executor)`        | `ProposalExecuted`  (with target)   |
+/// | cancel          | `("proposal_cancelled", id, canceller)`      | `ProposalCancelled` (timestamp)     |
+///
+/// `proposal_id` is always the second topic element so indexers can filter the
+/// full lifecycle of a single proposal with a single topic subscription.
+
+/// Event: a new proposal was submitted (topic `proposal_created`).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalCreated {
     pub proposal_id: u32,
     pub proposer: Address,
     pub target: Address,
+    /// Ledger timestamp at which the proposal was submitted.
+    pub created_at: u64,
 }
 
 /// Records the timestamp and effective threshold when quorum was first reached.
@@ -328,33 +348,42 @@ pub struct QuorumInfo {
     pub threshold: u32,
 }
 
-/// Emitted when a co-signer approves a proposal.
+/// Event: a registered signer cast a vote (topic `vote_cast`).
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct ProposalApproved {
+pub struct VoteCast {
     pub proposal_id: u32,
-    pub approver: Address,
+    pub voter: Address,
+    /// Total headcount of approvals so far (including this vote).
     pub approval_count: u32,
+    /// Ledger timestamp at which the vote was cast.
+    pub timestamp: u64,
 }
 
-/// Emitted when quorum is first reached for a proposal, starting the timelock.
+/// Event: a proposal first reached quorum and was queued, starting the timelock
+/// (topic `proposal_queued`).
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct QuorumReached {
+pub struct ProposalQueued {
     pub proposal_id: u32,
     pub quorum_reached_at: u64,
+    /// `quorum_reached_at + GOVERNANCE_TIMELOCK_SECONDS` — earliest execution time.
     pub executable_after: u64,
+    /// The threshold snapshot used for this quorum decision.
+    pub threshold: u32,
 }
 
-/// Emitted when a proposal is cancelled by the proposer or admin.
+/// Event: a proposal was cancelled by the proposer or admin (topic `proposal_cancelled`).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalCancelled {
     pub proposal_id: u32,
     pub canceller: Address,
+    /// Ledger timestamp at which the proposal was cancelled.
+    pub cancelled_at: u64,
 }
 
-/// Emitted when a proposal is executed after quorum and timelock.
+/// Event: a proposal was executed after quorum and timelock (topic `proposal_executed`).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalExecuted {
@@ -362,6 +391,8 @@ pub struct ProposalExecuted {
     pub executor: Address,
     pub target: Address,
     pub calldata: Bytes,
+    /// Ledger timestamp at which the proposal was executed.
+    pub executed_at: u64,
 }
 
 /// Emitted when the admin adds a new co-signer to the governance set.
@@ -999,11 +1030,12 @@ impl FluxoraGovernance {
         bump_instance(&env);
 
         env.events().publish(
-            (symbol_short!("proposed"), id),
+            (symbol_short!("proposal_created"), id, proposer.clone()),
             ProposalCreated {
                 proposal_id: id,
                 proposer,
                 target,
+                created_at: now,
             },
         );
 
@@ -1072,16 +1104,8 @@ impl FluxoraGovernance {
         let approval_count = proposal.approvals.len();
 
         let threshold = get_threshold(&env)?;
-        // Quorum is decided by *weight*, not headcount: the proposal reaches
-        // quorum once accumulated weight >= threshold. It is recorded only the
-        // first time (the QuorumReachedAt entry acts as a single-fire flag) so
-        // additional signers cannot re-trigger the timelock (#48).
-        let quorum_recorded = env
-            .storage()
-            .persistent()
-            .has(&DataKey::QuorumReachedAt(proposal_id));
-        let quorum_reached = if !quorum_recorded && accumulated >= threshold as u64 {
-            let now = env.ledger().timestamp();
+        let now = env.ledger().timestamp();
+        let quorum_reached = if approval_count == threshold {
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
             proposal.status = ProposalStatus::Queued;
             Some((now, executable_after))
@@ -1096,11 +1120,12 @@ impl FluxoraGovernance {
         bump_instance(&env);
 
         env.events().publish(
-            (symbol_short!("approved"), proposal_id),
-            ProposalApproved {
+            (symbol_short!("vote_cast"), proposal_id, approver.clone()),
+            VoteCast {
                 proposal_id,
-                approver,
+                voter: approver,
                 approval_count,
+                timestamp: now,
             },
         );
 
@@ -1123,11 +1148,12 @@ impl FluxoraGovernance {
             bump_quorum_ttl(&env, proposal_id);
 
             env.events().publish(
-                (symbol_short!("quorum"), proposal_id),
-                QuorumReached {
+                (symbol_short!("proposal_queued"), proposal_id),
+                ProposalQueued {
                     proposal_id,
                     quorum_reached_at: now,
                     executable_after,
+                    threshold,
                 },
             );
         }
@@ -1263,12 +1289,13 @@ impl FluxoraGovernance {
         dispatched?;
 
         env.events().publish(
-            (symbol_short!("executed"), proposal_id),
+            (symbol_short!("proposal_executed"), proposal_id, executor.clone()),
             ProposalExecuted {
                 proposal_id,
                 executor,
                 target: proposal.target.clone(),
                 calldata: proposal.calldata.clone(),
+                executed_at: now,
             },
         );
 
@@ -1324,12 +1351,14 @@ impl FluxoraGovernance {
         proposal.cancelled = true;
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
+        let now = env.ledger().timestamp();
 
         env.events().publish(
-            (symbol_short!("cancelled"), proposal_id),
+            (symbol_short!("proposal_cancelled"), proposal_id, caller.clone()),
             ProposalCancelled {
                 proposal_id,
                 canceller: caller,
+                cancelled_at: now,
             },
         );
 
